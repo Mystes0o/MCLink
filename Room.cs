@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -7,9 +8,13 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 
 namespace MCLink {
+    internal enum RouteMode { Automatic, DirectOnly, RelayOnly }
+
     internal sealed class Room {
+        static readonly string[] RelaySchemes = { "tcp", "udp", "ws", "wss", "quic" };
         internal readonly string Key;
         internal readonly int Port;
         internal Room(string key, int port) { Key = key; Port = port; }
@@ -38,7 +43,32 @@ namespace MCLink {
             if (exe == null) throw new FileNotFoundException("未找到 EasyTier，请先运行 setup.ps1 安装项目依赖。");
             return exe;
         }
-        internal string Config(bool host, int localPort, string peer, string listener) {
+        internal static string[] ReadRelays(string directory) {
+            string path = Path.Combine(directory, "relay.txt");
+            string[] lines;
+            try { lines = File.ReadAllLines(path, Encoding.UTF8); }
+            catch (FileNotFoundException) { throw new InvalidOperationException("请在 MCLink.exe 同目录创建 relay.txt，并填写中继地址。"); }
+            catch (IOException ex) { throw new InvalidOperationException("无法读取 relay.txt。", ex); }
+            catch (UnauthorizedAccessException ex) { throw new InvalidOperationException("无法读取 relay.txt。", ex); }
+
+            var relays = new List<string>();
+            for (int i = 0; i < lines.Length; i++) {
+                string value = lines[i].Trim();
+                if (value.Length == 0 || value.StartsWith("#", StringComparison.Ordinal)) continue;
+                Uri uri;
+                if (value.Any(char.IsWhiteSpace) || value.Any(char.IsControl) || value.IndexOfAny(new[] { '"', '\\' }) >= 0
+                    || !Uri.TryCreate(value, UriKind.Absolute, out uri)
+                    || !RelaySchemes.Contains(uri.Scheme)
+                    || String.IsNullOrEmpty(uri.Host) || uri.Port <= 0 || uri.UserInfo.Length != 0 || uri.Fragment.Length != 0)
+                    throw new InvalidOperationException("relay.txt 第 " + (i + 1) + " 行不是有效的中继地址，请检查协议、主机名和端口。");
+                relays.Add(value);
+            }
+            if (relays.Count == 0)
+                throw new InvalidOperationException("请在 relay.txt 中填写房主和好友都能连接的 EasyTier 中继地址。");
+            return relays.Distinct(StringComparer.Ordinal).ToArray();
+        }
+        internal string Config(bool host, int localPort, IEnumerable<string> peers, string listener,
+                               RouteMode mode = RouteMode.Automatic) {
             // A separate ACL per endpoint. Guest accepts no incoming application traffic.
             var sb = new StringBuilder();
             sb.AppendLine("instance_name = \"mclink-" + Guid.NewGuid().ToString("N") + "\"");
@@ -46,12 +76,54 @@ namespace MCLink {
             sb.AppendLine("listeners = [\"" + listener + "\"]");
             sb.AppendLine("rpc_portal = \"127.0.0.1:0\"");
             sb.AppendLine("[network_identity]\nnetwork_name = \"mc-" + Key.Substring(0,12) + "\"\nnetwork_secret = \"" + Key + "\"");
-            sb.AppendLine("[[peer]]\nuri = \"" + peer + "\"");
+            foreach (string peer in peers) sb.AppendLine("[[peer]]\nuri = \"" + peer + "\"");
             if (!host) sb.AppendLine("[[port_forward]]\nbind_addr = \"127.0.0.1:" + localPort + "\"\ndst_addr = \"10.144.144.1:" + Port + "\"\nproto = \"tcp\"");
             sb.AppendLine("[flags]\nno_tun = true\nbind_device = false\nrelay_network_whitelist = \"\"");
+            if (mode == RouteMode.DirectOnly) sb.AppendLine("p2p_only = true");
+            if (mode == RouteMode.RelayOnly) sb.AppendLine("disable_p2p = true");
             sb.AppendLine("[[acl.acl_v1.chains]]\nname = \"room-inbound\"\nchain_type = 1\ndefault_action = 2\nenabled = true");
             if (host) sb.AppendLine("[[acl.acl_v1.chains.rules]]\nname = \"minecraft\"\npriority = 1000\naction = 1\nprotocol = 1\nports = [\"" + Port + "\"]\nenabled = true");
             return sb.ToString();
+        }
+    }
+
+    internal sealed class PlayerStatus {
+        internal readonly int? Online;
+        internal readonly string[] Names;
+
+        PlayerStatus(int? online, string[] names) {
+            Online=online;
+            Names=names;
+        }
+
+        internal static PlayerStatus Parse(string json) {
+            var serializer=new JavaScriptSerializer {MaxJsonLength=1048576, RecursionLimit=32};
+            Dictionary<string, object> status;
+            try { status=serializer.DeserializeObject(json) as Dictionary<string, object>; }
+            catch (ArgumentException) { status=null; }
+            catch (InvalidOperationException) { status=null; }
+
+            object rawPlayers;
+            var players=status!=null && status.TryGetValue("players",out rawPlayers) ?
+                rawPlayers as Dictionary<string, object> : null;
+            if (players==null) return new PlayerStatus(null,new string[0]);
+            object rawOnline, rawSample;
+            int? online=players.TryGetValue("online",out rawOnline) ? rawOnline as int? : null;
+            if (online<0) online=null;
+            var sample=players.TryGetValue("sample",out rawSample) ? rawSample as object[] : null;
+            var names=new List<string>();
+            var seen=new HashSet<string>(StringComparer.Ordinal);
+            if (sample!=null) {
+                foreach (var entry in sample.OfType<Dictionary<string, object>>()) {
+                    if (online.HasValue && names.Count>=online.Value) break;
+                    object rawName;
+                    var name=entry.TryGetValue("name",out rawName) ? rawName as string : null;
+                    if (String.IsNullOrWhiteSpace(name) || name.Length>64 || name.Any(char.IsControl)) continue;
+                    name=name.Trim();
+                    if (seen.Add(name)) names.Add(name);
+                }
+            }
+            return new PlayerStatus(online,names.ToArray());
         }
     }
 
@@ -83,6 +155,14 @@ namespace MCLink {
             return data;
         }
         internal static long Check(int localPort, int gamePort) {
+            return Check(localPort,gamePort,null);
+        }
+        internal static PlayerStatus CheckPlayers(int port) {
+            PlayerStatus players=null;
+            Check(port,port,json => players=PlayerStatus.Parse(json));
+            return players;
+        }
+        static long Check(int localPort, int gamePort, Action<string> readStatus) {
             using (var socket = new TcpClient()) {
                 socket.NoDelay = true;
                 var connect = socket.BeginConnect(IPAddress.Loopback,localPort,null,null);
@@ -102,6 +182,10 @@ namespace MCLink {
                     using(var response=new MemoryStream(status)) {
                         if(response.ReadByte()!=0 || ReadSize(response)!=response.Length-response.Position || response.ReadByte()!=123)
                             throw new InvalidDataException("不是 Java 版状态响应。");
+                        if (readStatus!=null) {
+                            int start=(int)response.Position-1;
+                            readStatus(Encoding.UTF8.GetString(status,start,status.Length-start));
+                        }
                     }
                     byte[] ping=BitConverter.GetBytes(DateTime.UtcNow.Ticks);
                     byte[] request=new byte[10]; request[0]=9; request[1]=1;

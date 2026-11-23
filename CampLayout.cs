@@ -10,6 +10,7 @@ namespace MCLink {
     partial class Window {
         readonly Button copyTicket = new CampButton(), copyAddress = new CampButton();
         readonly Label rttValue = new Label(), p95Value = new Label(), samplesValue = new Label();
+        readonly Label playerCount = new Label(), playerNames = new Label();
         readonly List<Action<float>> layout = new List<Action<float>>();
         CampCanvas canvas;
         ToolTip tooltip;
@@ -80,6 +81,12 @@ namespace MCLink {
             Readout(rttValue,new Rectangle(357,878,118,39),31,White);
             Readout(p95Value,new Rectangle(510,878,119,39),31,White);
             Readout(samplesValue,new Rectangle(663,878,127,39),31,White);
+            Readout(playerCount,new Rectangle(338,842,731,37),24,Color.FromArgb(177,219,95));
+            Readout(playerNames,new Rectangle(338,879,731,42),27,White);
+            playerCount.Padding=playerNames.Padding=new Padding(9,0,0,0);
+            playerCount.AccessibleName="在线玩家人数";
+            playerNames.AccessibleName="在线玩家昵称";
+            playerNames.AutoEllipsis=true;
             tooltip=new ToolTip { AutoPopDelay=10000 };
             FormClosed+=delegate {tooltip.Dispose();};
             Resize+=delegate { ResizeCamp(); };
@@ -166,6 +173,25 @@ namespace MCLink {
             };
         }
 
+        void ShowPlayers(PlayerStatus players) {
+            playerCount.Visible=playerNames.Visible=hosting;
+            rttValue.Visible=p95Value.Visible=samplesValue.Visible=address.Visible=!hosting;
+            if (!hosting) return;
+
+            playerCount.Text="在线玩家（含房主）";
+            if (players==null) playerNames.Text="正在等待游戏状态…";
+            else {
+                if (players.Online.HasValue) playerCount.Text+="  " + players.Online.Value + " 人";
+                if (players.Online==0) playerNames.Text="暂无玩家";
+                else if (players.Names.Length==0) playerNames.Text="游戏未公开昵称";
+                else {
+                    var names=String.Join("、",players.Names);
+                    playerNames.Text=players.Online>players.Names.Length ? "部分玩家："+names : names;
+                }
+            }
+            tooltip.SetToolTip(playerNames,playerNames.Text);
+        }
+
         void ShowConnection(string state, long? milliseconds=null, long? p95=null, string samples=null) {
             string caption=state;
             if(state.StartsWith("等待建房")) caption="等待联机";
@@ -173,11 +199,12 @@ namespace MCLink {
             else if(state.StartsWith("请输入") || state.Contains("邀请码格式")) caption="输入有误";
             else if(state.StartsWith("尚未收到")) caption="等待游戏响应";
             else if(state.StartsWith("正在")) caption="正在连接…";
+            else if(state.StartsWith("游戏可连接")) caption="游戏可连接";
             else if(state!="游戏可连接") caption="连接有问题";
             status.Text=caption;
             tooltip.SetToolTip(status,state);
             canvas.StatusIcon=caption=="游戏可连接" || caption=="房间已开启";
-            canvas.Notice=caption=="输入有误" || caption=="连接有问题" || caption=="等待游戏响应" ? state : "";
+            canvas.Notice=caption=="等待联机" || caption=="房间已开启" ? "" : state;
             canvas.Invalidate();
             rttValue.Text=milliseconds.HasValue ? milliseconds+" ms" : "—";
             p95Value.Text=p95.HasValue ? p95+" ms" : "—";

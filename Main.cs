@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -12,22 +13,43 @@ namespace MCLink {
         readonly TextBox ticket = new TextBox(), address = new TextBox {ReadOnly=true};
         readonly Button host=new CampButton(), join=new CampButton(), leave=new CampButton();
         readonly Label status=new Label();
-        readonly Timer timer=new Timer { Interval=2500 };
+        readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer { Interval=2500 };
         readonly List<long> samples=new List<long>();
         readonly Queue<bool> attempts=new Queue<bool>();
+        readonly HashSet<Task<GuestConnection>> selectionWork=new HashSet<Task<GuestConnection>>();
         Session session;
+        CancellationTokenSource selection;
+        Room activeRoom;
+        string[] activeRelays;
+        string route;
+        int consecutiveFailures;
+        DateTime nextSelection;
         int local, remote, generation;
-        bool hosting, probing;
-        const string Peer="tcp://public.easytier.cn:11010";
+        bool hosting, probing, closing, addressChanged;
         Window() {
             BuildLayout();
             Stop();
             timer.Tick+=async delegate { await Probe(); }; timer.Start();
-            FormClosing+=delegate {timer.Stop(); Stop();};
+            FormClosing+=CloseConnections;
+        }
+        async void CloseConnections(object sender, FormClosingEventArgs args) {
+            if (closing) { args.Cancel=true; return; }
+            timer.Stop(); Stop();
+            if (selectionWork.Count==0) return;
+            args.Cancel=true;
+            closing=true;
+            host.Enabled=join.Enabled=false;
+            await Task.Yield();
+            try { await Task.WhenAll(selectionWork.ToArray()); }
+            catch (Exception) {}
+            finally { selectionWork.RemoveWhere(work => work.IsCompleted); closing=false; Close(); }
         }
         void Copy(string s) {
             if(s.Length==0) return;
-            try {Clipboard.SetText(s);} catch(Exception) {MessageBox.Show("剪贴板忙，请选中文本后手动复制。");}
+            try {
+                Clipboard.SetText(s);
+                if (s==address.Text) addressChanged=false;
+            } catch(Exception) {MessageBox.Show("剪贴板忙，请选中文本后手动复制。");}
         }
         async Task StartRoom(bool create) {
             if (!host.Enabled) return;
@@ -43,7 +65,11 @@ namespace MCLink {
                 field.SelectAll();
                 return;
             }
+            string[] relays;
+            try { relays=Room.ReadRelays(AppDomain.CurrentDomain.BaseDirectory); }
+            catch (InvalidOperationException ex) { ShowConnection(ex.Message); return; }
             int current=++generation;
+            PlayerStatus players=null;
             try {
                 host.Enabled=join.Enabled=false;
                 port.ReadOnly=ticket.ReadOnly=true;
@@ -51,16 +77,26 @@ namespace MCLink {
                 if(create) {
                     room=Room.Create(gamePort);
                     ShowConnection("正在检查本机游戏端口…");
-                    await Task.Run(()=>GameProbe.Check(room.Port,room.Port));
+                    players=await Task.Run(()=>GameProbe.CheckPlayers(room.Port));
                     if(current!=generation) return;
                 }
-                hosting=create; remote=room.Port; local=create ? remote : Room.FreePort();
-                session=new Session(room.Config(create,local,Peer,"udp://0.0.0.0:0"));
-                ticket.Text=room.Ticket; address.Text=create ? "" : "127.0.0.1:"+local;
+                hosting=create;
+                activeRoom=room; activeRelays=relays; remote=room.Port;
+                if (create) {
+                    local=remote;
+                    session=new Session(room.Config(true,local,relays,"udp://0.0.0.0:0"));
+                } else {
+                    var connection=await SelectGuest(current, true);
+                    if (connection==null) return;
+                    if (current!=generation) { connection.Dispose(); return; }
+                    UseGuest(connection);
+                }
+                ticket.Text=room.Ticket;
                 copyTicket.Enabled=create;
                 copyTicket.Visible=create;
                 copyAddress.Visible=!create;
-                ShowConnection(create ? "房间已启动，请复制邀请码。" : "正在连接房主的游戏…");
+                ShowPlayers(players);
+                ShowConnection(create ? "房间已启动，请复制邀请码。" : "正在确认游戏响应…");
             } catch(Exception ex) {
                 if(current!=generation) return;
                 Stop();
@@ -68,26 +104,91 @@ namespace MCLink {
                     "建房失败，请核对游戏端口及局域网开放状态。"+ex.Message : ex.Message);
             }
         }
+        async Task<GuestConnection> SelectGuest(int current, bool initial) {
+            var cancellation=new CancellationTokenSource();
+            selection=cancellation;
+            var progress=new Progress<string>(message => {
+                if (generation==current && selection==cancellation) ShowConnection(message);
+            });
+            var room=activeRoom;
+            var relays=activeRelays;
+            ShowConnection(initial ? "正在尝试点对点直连…" : "正在重测线路，当前连接连续无响应…");
+            var work=Task.Run(() => {
+                var selected=GuestConnection.Select(room, relays, progress, cancellation.Token);
+                if (selected==null && initial && !cancellation.IsCancellationRequested)
+                    selected=GuestConnection.Automatic(room, relays);
+                if (!cancellation.IsCancellationRequested) return selected;
+                if (selected!=null) selected.Dispose();
+                return null;
+            });
+            selectionWork.Add(work);
+            try {
+                return await work;
+            } catch (OperationCanceledException) { return null; }
+            finally {
+                selectionWork.Remove(work);
+                if (selection==cancellation) selection=null;
+                cancellation.Dispose();
+            }
+        }
+
+        void UseGuest(GuestConnection connection, bool changed = false) {
+            if (session!=null) session.Dispose();
+            session=connection.Session;
+            local=connection.Port;
+            route=connection.Description;
+            addressChanged=changed;
+            address.Text="127.0.0.1:"+local;
+            copyAddress.Enabled=false;
+            samples.Clear(); attempts.Clear(); consecutiveFailures=0;
+            nextSelection=DateTime.UtcNow.AddSeconds(30);
+        }
+
         async Task Probe() {
             if(session==null || probing) return;
-            if(!session.Running) {Stop(); ShowConnection("组网进程已退出，请检查组件、网络后重新建房或加入。"); return;}
+            if(!session.Running && hosting) {Stop(); ShowConnection("组网进程已退出，请检查组件、网络后重新建房。"); return;}
             int current=generation, target=local, game=remote; probing=true;
             long ms=-1;
-            try { ms=await Task.Run(()=>GameProbe.Check(target,game)); }
+            PlayerStatus players=null;
+            try {
+                if (session.Running) {
+                    if (hosting) players=await Task.Run(()=>GameProbe.CheckPlayers(game));
+                    else ms=await Task.Run(()=>GameProbe.Check(target,game));
+                }
+            }
             catch(Exception) {}
             finally {probing=false;}
             if(current!=generation) return;
+            if (target!=local) return;
             if(hosting) {
-                ShowConnection(ms<0 ? "本机游戏端口无响应，请确认存档仍然开放。" : "本机存档可用，请把邀请码发给好友。");
+                ShowPlayers(players);
+                ShowConnection(players==null ? "本机游戏端口无响应，请确认存档仍然开放。" : "本机存档可用，请把邀请码发给好友。");
                 return;
             }
             attempts.Enqueue(ms>=0); if(attempts.Count>24) attempts.Dequeue();
+            consecutiveFailures=ms>=0 ? 0 : consecutiveFailures+1;
             copyAddress.Enabled=ms>=0;
             if(ms>=0) {samples.Add(ms); if(samples.Count>24) samples.RemoveAt(0);}
             long? p95=samples.Count==0 ? (long?)null :
                 samples.OrderBy(v=>v).ElementAt((int)Math.Ceiling(samples.Count*.95)-1);
-            ShowConnection(ms>=0 ? "游戏可连接" :
-                "尚未收到游戏响应，请确认房主在线、端口正确且双方可访问引导节点。",
+            if (selection!=null) return;
+            if (consecutiveFailures>=4 && DateTime.UtcNow>=nextSelection) {
+                try {
+                    var replacement=await SelectGuest(current, false);
+                    if (replacement!=null) {
+                        if (current==generation && consecutiveFailures>=4) {
+                            UseGuest(replacement, true);
+                            ShowConnection("已更换线路，请使用新的地址重新连接。");
+                            return;
+                        }
+                        replacement.Dispose();
+                    }
+                } catch (Exception) {}
+                if (current==generation) nextSelection=DateTime.UtcNow.AddSeconds(30);
+                return;
+            }
+            ShowConnection(ms>=0 ? "游戏可连接 · " + route + (addressChanged ? "，请复制新地址" : "") :
+                "尚未收到游戏响应，请确认房主在线、端口正确且双方可访问中继。",
                 ms>=0 ? (long?)ms : null,p95,attempts.Count(ok=>ok)+"/"+attempts.Count);
         }
         static int ReadGamePort(string input) {
@@ -98,11 +199,13 @@ namespace MCLink {
             return number;
         }
         void Stop() {
+            if (selection!=null) { selection.Cancel(); selection=null; }
             generation++; if(session!=null) {session.Dispose();session=null;}
             if(hosting) ticket.Clear(); hosting=false; address.Clear(); samples.Clear(); attempts.Clear();
             host.Enabled=join.Enabled=true; leave.Enabled=false; port.ReadOnly=ticket.ReadOnly=false;
             copyTicket.Enabled=copyAddress.Enabled=false;
             copyTicket.Visible=false; copyAddress.Visible=true;
+            ShowPlayers(null);
             ShowConnection("等待建房或加入");
         }
         [STAThread] static void Main() {Application.EnableVisualStyles();Application.Run(new Window());}

@@ -31,9 +31,9 @@ namespace MCLink {
             Console.WriteLine("Local test game: "+GameProbe.Check(port,port)+" ms");
             int bridge=Room.FreePort(), seed=Room.FreePort();
             string endpoint="tcp://127.0.0.1:"+seed;
-            var hostConfig=room.Config(true,port,endpoint,endpoint).Replace("[[peer]]\nuri = \""+endpoint+"\"","");
+            var hostConfig=room.Config(true,port,new string[0],endpoint);
             using(var host=new Session(hostConfig,AppDomain.CurrentDomain.BaseDirectory))
-            using(var guest=new Session(room.Config(false,bridge,endpoint,"tcp://127.0.0.1:0"),AppDomain.CurrentDomain.BaseDirectory)) {
+            using(var guest=new Session(room.Config(false,bridge,new[] { endpoint },"tcp://127.0.0.1:0"),AppDomain.CurrentDomain.BaseDirectory)) {
                 for(int i=0;i<30;i++) {
                     Thread.Sleep(500);
                     try {

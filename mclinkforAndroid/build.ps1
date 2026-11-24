@@ -3,7 +3,8 @@ param(
     [string]$JavaHome = $env:JAVA_HOME,
     [string]$EclipseCompiler,
     [string]$RelayFile,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [switch]$TestPackage
 )
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
@@ -11,7 +12,9 @@ $tools = Join-Path $project 'runtime/android-tools'
 if (!$RelayFile) { $RelayFile = Join-Path $project 'relay.txt' }
 $RelayFile = (Resolve-Path -LiteralPath $RelayFile).Path
 if (!$SdkRoot) { $SdkRoot = Join-Path $tools 'sdk' }
-if (!$OutputPath) { $OutputPath = Join-Path $project 'MCLinkForAndroid.apk' }
+if (!$OutputPath) {
+    $OutputPath = Join-Path $project $(if ($TestPackage) { 'MCLinkForAndroid-Test.apk' } else { 'MCLinkForAndroid.apk' })
+}
 if (!$JavaHome) {
     $javaCommand = Get-Command java.exe -ErrorAction Stop
     $JavaHome = Split-Path -Parent (Split-Path -Parent $javaCommand.Source)
@@ -57,6 +60,16 @@ try {
     Invoke-Tool (Join-Path $buildTools 'd8.bat') (@('--lib',$platform,'--min-api','26','--output',$work) + $dex)
 
     $unsigned = Join-Path $work 'unsigned.apk'
+    if ($TestPackage) {
+        $testManifest = Join-Path $work 'AndroidManifest.xml'
+        $xml = Get-Content -LiteralPath $manifest -Raw
+        $xml = $xml.Replace('package="io.github.mystes0o.mclink"', 'package="io.github.mystes0o.mclink.lantest"')
+        $xml = $xml.Replace('android:label="MCLink for Android"', 'android:label="MCLink 测试版"')
+        $xml = $xml.Replace('android:name=".MainActivity"', 'android:name="io.github.mystes0o.mclink.MainActivity"')
+        $xml = $xml.Replace('android:name=".RoomVpn"', 'android:name="io.github.mystes0o.mclink.RoomVpn"')
+        Set-Content -LiteralPath $testManifest -Value $xml -Encoding UTF8
+        $manifest = $testManifest
+    }
     Invoke-Tool (Join-Path $buildTools 'aapt2.exe') @('link','-o',$unsigned,'-I',$platform,
         '--manifest',$manifest,'--version-code','1','--version-name','0.1.0')
     Add-Type -AssemblyName System.IO.Compression.FileSystem

@@ -22,11 +22,11 @@ namespace MCLink {
         readonly TcpListener listener=new TcpListener(IPAddress.Loopback,0);
         readonly HashSet<Link> links=new HashSet<Link>();
         readonly int targetPort;
-        readonly RouteMode? report;
+        readonly Func<RouteMode> report;
         bool disposed;
 
         // The guest prepends a report. The host removes it and observes the login name.
-        internal PlayerRouteBridge(int targetPort, RouteMode? report=null) {
+        internal PlayerRouteBridge(int targetPort, Func<RouteMode> report=null) {
             this.targetPort=targetPort;
             this.report=report;
             listener.Start();
@@ -43,9 +43,9 @@ namespace MCLink {
                     .ToDictionary(group=>group.Key,group=> {
                         var mode=group.First().Route;
                         if (group.Any(link=>link.Route!=mode)) return "待确认";
-                        if (mode==RouteMode.DirectOnly) return "直连";
-                        if (mode==RouteMode.RelayOnly) return "中继";
-                        return "自动选路（线路未确认）";
+                        if (mode==RouteMode.DirectOnly) return "接入时直连";
+                        if (mode==RouteMode.RelayOnly) return "接入时中继";
+                        return "接入时线路未确认";
                     },StringComparer.OrdinalIgnoreCase);
             }
         }
@@ -72,9 +72,9 @@ namespace MCLink {
                 await link.Target.ConnectAsync(IPAddress.Loopback,targetPort).ConfigureAwait(false);
                 var input=link.Source.GetStream();
                 var output=link.Target.GetStream();
-                if (report.HasValue) {
+                if (report!=null) {
                     // Zero is not a valid first Minecraft packet length.
-                    var header=new byte[] {0,(byte)report.Value};
+                    var header=new byte[] {0,(byte)report()};
                     await output.WriteAsync(header,0,header.Length).ConfigureAwait(false);
                 } else {
                     using (var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(15)))

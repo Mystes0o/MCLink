@@ -103,17 +103,18 @@ namespace MCLink {
                 && RelaySchemes.Contains(uri.Scheme) && uri.Host.Length>0 && uri.Port>0
                 && uri.UserInfo.Length==0 && uri.Fragment.Length==0;
         }
-        internal string Config(bool host, int localPort, IEnumerable<string> peers, string listener,
+        internal string Config(bool host, int localPort, IEnumerable<string> peers, string listener = null,
                                RouteMode mode = RouteMode.Automatic, int? bedrockPort = null) {
             // A separate ACL per endpoint. Guest accepts no incoming application traffic.
             var sb = new StringBuilder();
             sb.AppendLine("instance_name = \"mclink-" + Guid.NewGuid().ToString("N") + "\"");
             sb.AppendLine(host ? "ipv4 = \""+HostVirtualIp+"\"" : "dhcp = true");
-            sb.AppendLine("listeners = [\"" + listener + "\"]");
+            sb.AppendLine(listener==null ? "listeners = [\"udp://0.0.0.0:0\", \"tcp://0.0.0.0:0\"]" :
+                "listeners = [\"" + listener + "\"]");
             sb.AppendLine("rpc_portal = \"127.0.0.1:0\"");
             AppendNetwork(sb,peers);
             if (!host) sb.AppendLine("[[port_forward]]\nbind_addr = \"127.0.0.1:" + localPort + "\"\ndst_addr = \""+HostVirtualIp+":" + Port + "\"\nproto = \"tcp\"");
-            sb.AppendLine("[flags]\nno_tun = true\nbind_device = false\nrelay_network_whitelist = \"\"");
+            sb.AppendLine("[flags]\nno_tun = true\nbind_device = false\nenable_ipv6 = true\nlatency_first = false\nrelay_network_whitelist = \"\"");
             if (mode == RouteMode.DirectOnly) sb.AppendLine("p2p_only = true");
             if (mode == RouteMode.RelayOnly) sb.AppendLine("disable_p2p = true");
             AppendInboundAcl(sb);
@@ -183,6 +184,18 @@ namespace MCLink {
     }
 
     internal static class GameProbe {
+        internal static void AnnounceLocalRoom(int gamePort) {
+            // Java Edition uses the datagram source IP as the address to connect to.
+            var announcement=Encoding.UTF8.GetBytes("[MOTD]MCLink 房间[/MOTD][AD]"+
+                gamePort.ToString(System.Globalization.CultureInfo.InvariantCulture)+"[/AD]");
+            try {
+                using (var udp=new UdpClient(new IPEndPoint(IPAddress.Loopback,0)))
+                    udp.Send(announcement,announcement.Length,new IPEndPoint(IPAddress.Loopback,4445));
+            } catch (SocketException) {
+                // Manual connection is still available if local discovery is unavailable.
+            }
+        }
+
         static void VarInt(Stream stream, int n) {
             while (n >= 128) { stream.WriteByte((byte)(n | 128)); n >>= 7; }
             stream.WriteByte((byte)n);

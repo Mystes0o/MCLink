@@ -29,16 +29,18 @@ namespace MCLink {
             if(Room.Parse(room.Ticket).Key!=room.Key) throw new Exception("Ticket round trip");
             try {Room.Parse(room.Ticket+" ");}catch {throw new Exception("Ticket whitespace");}
             Console.WriteLine("Local test game: "+GameProbe.Check(port,port)+" ms");
-            int bridge=Room.FreePort(), seed=Room.FreePort();
+            int bridge=Room.FreePort(), seed=Room.FreePort(), rpc=Room.FreePort();
             string endpoint="tcp://127.0.0.1:"+seed;
             var hostConfig=room.Config(true,port,new string[0],endpoint);
             using(var host=new Session(hostConfig,AppDomain.CurrentDomain.BaseDirectory))
-            using(var guest=new Session(room.Config(false,bridge,new[] { endpoint },"tcp://127.0.0.1:0"),AppDomain.CurrentDomain.BaseDirectory)) {
+            using(var guest=new Session(room.Config(false,bridge,new[] { endpoint },"tcp://127.0.0.1:0"),
+                AppDomain.CurrentDomain.BaseDirectory,rpcPort:rpc)) {
                 for(int i=0;i<30;i++) {
                     Thread.Sleep(500);
                     try {
                         long ms=GameProbe.Check(bridge,port);
-                        Console.WriteLine("PASS two EasyTier processes, invite, TCP forward, Java status + ping/pong: "+ms+" ms");
+                        if (Session.ReadHostRoute(rpc)!=RouteMode.DirectOnly) continue;
+                        Console.WriteLine("PASS two EasyTier processes, invite, TCP forward, Java status + ping/pong, direct route: "+ms+" ms");
                         return;
                     }catch(Exception e) { if(i==1 || i==29) Console.WriteLine("Probe: "+e.Message); if(!host.Running || !guest.Running) break; }
                 }

@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class RoomVpn extends VpnService {
@@ -30,6 +31,7 @@ public final class RoomVpn extends VpnService {
     private static final ExecutorService ENGINE = Executors.newSingleThreadExecutor();
     static volatile State state = new State("等待加入房间", 0, false);
     private volatile boolean alive;
+    private volatile int route;
     private volatile String endMessage = "已断开房间";
     private boolean joined;
 
@@ -81,6 +83,7 @@ public final class RoomVpn extends VpnService {
 
     private void connect(RoomTicket room, int startId) {
         ParcelFileDescriptor tunnel = null;
+        JavaRouteBridge bridge = null;
         try {
             if (!alive) return;
             final int probePort;
@@ -90,6 +93,8 @@ public final class RoomVpn extends VpnService {
             String[] relays = room.javaRoom ? bundledRelays() : null;
             if (EasyTierJNI.runNetworkInstance(room.config(probePort, relays)) != 0)
                 throw new IllegalStateException("EasyTier 启动失败，请检查房间码和设备网络。");
+            if (room.reportsPlayerRoutes) bridge = new JavaRouteBridge(probePort, () -> route);
+            int gamePort = bridge == null ? probePort : bridge.port();
             long deadline = SystemClock.elapsedRealtime() + 45000;
             while (!room.javaRoom && alive && SystemClock.elapsedRealtime() < deadline && tunnel == null) {
                 JSONObject info = networkInfo(room.instance);
@@ -115,12 +120,15 @@ public final class RoomVpn extends VpnService {
             while (alive) {
                 boolean available = room.javaRoom ? JavaGameProbe.check(probePort, room.port) : probe(probePort);
                 if (!alive) break;
+                if (room.javaRoom) route = available ? hostRoute(networkInfo(room.instance)) : 0;
                 if (available) {
                     connected = true;
                     unsuccessful = 0;
+                    if (room.javaRoom) LanRoomAnnouncement.send(gamePort);
                     state = room.javaRoom
-                            ? new State("已连接房主。请在手机 Java 版的「多人游戏 → 直接连接」中粘贴地址。",
-                                    probePort, true, true)
+                            ? new State("已连接房主 · " + (route == 1 ? "点对点直连" :
+                                    route == 2 ? "中继（仍在尝试直连）" : "线路未确认") +
+                                    "\n在 Java 版「多人游戏」中选择 MCLink 房间。", gamePort, true, true)
                             : new State("已连接房主，可以打开 Minecraft", room.port, true);
                 } else if (++unsuccessful >= 4) {
                     state = new State(connected ? "与房主暂时断开，正在重连…" :
@@ -134,6 +142,7 @@ public final class RoomVpn extends VpnService {
             if (alive) endMessage = error instanceof IllegalStateException && error.getMessage() != null
                     ? error.getMessage() : "连接失败，请重试。";
         } finally {
+            if (bridge != null) bridge.close();
             try { if (tunnel != null) tunnel.close(); } catch (Exception ignored) {}
             try { EasyTierJNI.retainNetworkInstance(new String[0]); } catch (LinkageError ignored) {}
             stopSelf(startId);
@@ -158,9 +167,23 @@ public final class RoomVpn extends VpnService {
             String json = EasyTierJNI.collectNetworkInfos(1);
             JSONObject map = json == null ? null : new JSONObject(json).optJSONObject("map");
             return map == null ? null : map.optJSONObject(instance);
-        } catch (org.json.JSONException invalid) {
+        } catch (org.json.JSONException | RuntimeException unavailable) {
             return null;
         }
+    }
+
+    static int hostRoute(JSONObject info) {
+        JSONArray routes = info == null ? null : info.optJSONArray("routes");
+        if (routes == null) return 0;
+        for (int i = 0; i < routes.length(); i++) {
+            JSONObject entry = routes.optJSONObject(i);
+            JSONObject ipv4 = entry == null ? null : entry.optJSONObject("ipv4_addr");
+            JSONObject address = ipv4 == null ? null : ipv4.optJSONObject("address");
+            if (address == null || address.optLong("addr", 0) != 0x0a909001L) continue;
+            int hops = entry.optInt("cost");
+            if (hops > 0) return hops == 1 ? 1 : 2;
+        }
+        return 0;
     }
 
     private static boolean probe(int port) {

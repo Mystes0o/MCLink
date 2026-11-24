@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -16,17 +15,14 @@ namespace MCLink {
         readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer { Interval=2500 };
         readonly List<long> samples=new List<long>();
         readonly Queue<bool> attempts=new Queue<bool>();
-        readonly HashSet<Task<GuestConnection>> selectionWork=new HashSet<Task<GuestConnection>>();
         Task crossplayShutdown;
         Session session;
         PlayerRouteBridge routeBridge;
-        CancellationTokenSource selection;
-        Room activeRoom;
-        string[] activeRelays;
-        int consecutiveFailures;
-        DateTime nextSelection;
-        int local, remote, generation;
-        bool hosting, probing, closing, addressChanged;
+        string guestConfig;
+        DateTime nextGuestRestart;
+        volatile RouteMode guestRoute;
+        int local, remote, generation, guestRpcPort;
+        bool hosting, probing, closing;
         Window() {
             BuildLayout();
             Stop();
@@ -36,22 +32,21 @@ namespace MCLink {
         async void CloseConnections(object sender, FormClosingEventArgs args) {
             if (closing) { args.Cancel=true; return; }
             timer.Stop(); Stop();
-            if (selectionWork.Count==0 && crossplayWork.Count==0 && !SavingCrossplay) return;
+            if (crossplayWork.Count==0 && !SavingCrossplay) return;
             args.Cancel=true;
             closing=true;
             host.Enabled=join.Enabled=false;
             await Task.Yield();
-            var pending=selectionWork.Cast<Task>().Concat(crossplayWork);
+            IEnumerable<Task> pending=crossplayWork;
             if (SavingCrossplay) pending=pending.Concat(new[] {crossplayShutdown});
             try { await Task.WhenAll(pending.ToArray()); }
             catch (Exception) {}
-            finally { selectionWork.RemoveWhere(work => work.IsCompleted); closing=false; Close(); }
+            finally { closing=false; Close(); }
         }
         void Copy(string s) {
             if(s.Length==0) return;
             try {
                 Clipboard.SetText(s);
-                if (s==address.Text) addressChanged=false;
             } catch(Exception) {MessageBox.Show("剪贴板忙，请选中文本后手动复制。");}
         }
         async Task StartRoom(bool create, CrossplayServer managed=null) {
@@ -88,10 +83,10 @@ namespace MCLink {
                     room=Room.Create(routeBridge.Port,true,requestedGeyserPort,managed==null ? null : relays);
                 }
                 hosting=create;
-                activeRoom=room; activeRelays=relays; remote=create ? gamePort : room.Port;
+                remote=create ? gamePort : room.Port;
                 if (create) {
                     local=remote;
-                    session=new Session(room.Config(true,local,relays,"udp://0.0.0.0:0",bedrockPort:requestedGeyserPort));
+                    session=new Session(room.Config(true,local,relays,bedrockPort:requestedGeyserPort));
                     if (managed!=null) {
                         await Task.Delay(400);
                         if (current!=generation) return;
@@ -101,10 +96,15 @@ namespace MCLink {
                     }
                     UpdateAndroidLink();
                 } else {
-                    var connection=await SelectGuest(current, true);
-                    if (connection==null) return;
-                    if (current!=generation) { connection.Dispose(); return; }
-                    UseGuest(connection);
+                    local=Room.FreePort();
+                    do { guestRpcPort=Room.FreePort(); } while (guestRpcPort==local);
+                    guestConfig=room.Config(false,local,relays);
+                    guestRoute=RouteMode.Automatic;
+                    session=new Session(guestConfig,rpcPort:guestRpcPort);
+                    if (room.ReportsPlayerRoutes) routeBridge=new PlayerRouteBridge(local,()=>guestRoute);
+                    address.Text="127.0.0.1:"+(routeBridge==null ? local : routeBridge.Port);
+                    copyAddress.Enabled=false;
+                    ShowRoute("正在确认线路");
                 }
                 ticket.Text=room.Ticket;
                 copyTicket.Enabled=create;
@@ -120,67 +120,31 @@ namespace MCLink {
                     "建房失败，请核对游戏端口及局域网开放状态。"+ex.Message : ex.Message);
             }
         }
-        async Task<GuestConnection> SelectGuest(int current, bool initial) {
-            var cancellation=new CancellationTokenSource();
-            selection=cancellation;
-            var progress=new Progress<string>(message => {
-                if (generation==current && selection==cancellation) ShowConnection(message);
-            });
-            var room=activeRoom;
-            var relays=activeRelays;
-            if (initial) ShowRoute("检测中…");
-            ShowConnection(initial ? "正在尝试点对点直连…" : "正在重测线路，当前连接连续无响应…");
-            var work=Task.Run(() => {
-                var selected=GuestConnection.Select(room, relays, progress, cancellation.Token);
-                if (selected==null && initial && !cancellation.IsCancellationRequested)
-                    selected=GuestConnection.Automatic(room, relays);
-                if (!cancellation.IsCancellationRequested) return selected;
-                if (selected!=null) selected.Dispose();
-                return null;
-            });
-            selectionWork.Add(work);
-            try {
-                return await work;
-            } catch (OperationCanceledException) { return null; }
-            finally {
-                selectionWork.Remove(work);
-                if (selection==cancellation) selection=null;
-                cancellation.Dispose();
-            }
-        }
-
-        void UseGuest(GuestConnection connection, bool changed = false) {
-            PlayerRouteBridge bridge=null;
-            try {
-                if (activeRoom.ReportsPlayerRoutes) bridge=new PlayerRouteBridge(connection.Port,connection.Mode);
-            } catch {
-                connection.Dispose();
-                throw;
-            }
-            if (routeBridge!=null) routeBridge.Dispose();
-            if (session!=null) session.Dispose();
-            routeBridge=bridge;
-            session=connection.Session;
-            local=connection.Port;
-            ShowRoute(connection.Description);
-            addressChanged=changed;
-            address.Text="127.0.0.1:"+(bridge==null ? local : bridge.Port);
-            copyAddress.Enabled=false;
-            samples.Clear(); attempts.Clear(); consecutiveFailures=0;
-            nextSelection=DateTime.UtcNow.AddSeconds(30);
-        }
-
         async Task Probe() {
-            if(session==null || probing) return;
+            if((session==null && guestConfig==null) || probing) return;
             if(crossplay!=null && !crossplay.Running) {Stop(); ShowConnection("本地 Java 服务端已退出，请查看联机存档的启动日志。"); return;}
-            if(!session.Running && hosting) {Stop(); ShowConnection("组网进程已退出，请检查组件、网络后重新建房。"); return;}
-            int current=generation, target=local, game=remote; probing=true;
+            if(hosting && !session.Running) {Stop(); ShowConnection("组网进程已退出，请检查组件、网络后重新建房。"); return;}
+            if (!hosting && (session==null || !session.Running)) {
+                copyAddress.Enabled=false;
+                guestRoute=RouteMode.Automatic;
+                ShowRoute("正在重连");
+                if (DateTime.UtcNow<nextGuestRestart) return;
+                nextGuestRestart=DateTime.UtcNow.AddSeconds(10);
+                if (session!=null) { session.Dispose(); session=null; }
+                try { session=new Session(guestConfig,rpcPort:guestRpcPort); }
+                catch (Exception error) { ShowConnection("正在重试启动组网："+error.Message); return; }
+            }
+            int current=generation, target=local, game=remote, rpc=guestRpcPort; probing=true;
             long ms=-1;
             PlayerStatus players=null;
+            RouteMode route=RouteMode.Automatic;
             try {
                 if (session.Running) {
                     if (hosting) players=await Task.Run(()=>GameProbe.CheckPlayers(game));
-                    else ms=await Task.Run(()=>GameProbe.Check(target,game));
+                    else {
+                        ms=await Task.Run(()=>GameProbe.Check(target,game));
+                        route=await Task.Run(()=>Session.ReadHostRoute(rpc));
+                    }
                 }
             }
             catch(Exception) {}
@@ -195,28 +159,18 @@ namespace MCLink {
                 return;
             }
             attempts.Enqueue(ms>=0); if(attempts.Count>24) attempts.Dequeue();
-            consecutiveFailures=ms>=0 ? 0 : consecutiveFailures+1;
+            guestRoute=route;
+            ShowRoute(route==RouteMode.DirectOnly ? "点对点直连" :
+                route==RouteMode.RelayOnly ? "中继（仍在尝试直连）" : "线路未确认");
             copyAddress.Enabled=ms>=0;
-            if(ms>=0) {samples.Add(ms); if(samples.Count>24) samples.RemoveAt(0);}
+            if(ms>=0) {
+                GameProbe.AnnounceLocalRoom(routeBridge==null ? local : routeBridge.Port);
+                samples.Add(ms);
+                if(samples.Count>24) samples.RemoveAt(0);
+            }
             long? p95=samples.Count==0 ? (long?)null :
                 samples.OrderBy(v=>v).ElementAt((int)Math.Ceiling(samples.Count*.95)-1);
-            if (selection!=null) return;
-            if (consecutiveFailures>=4 && DateTime.UtcNow>=nextSelection) {
-                try {
-                    var replacement=await SelectGuest(current, false);
-                    if (replacement!=null) {
-                        if (current==generation && consecutiveFailures>=4) {
-                            UseGuest(replacement, true);
-                            ShowConnection("已更换线路，请使用新的地址重新连接。");
-                            return;
-                        }
-                        replacement.Dispose();
-                    }
-                } catch (Exception) {}
-                if (current==generation) nextSelection=DateTime.UtcNow.AddSeconds(30);
-                return;
-            }
-            ShowConnection(ms>=0 ? (addressChanged ? "游戏可连接，请复制新地址" : "游戏可连接") :
+            ShowConnection(ms>=0 ? "游戏可连接，在「多人游戏」中选择 MCLink 房间" :
                 "尚未收到游戏响应，请确认房主在线、端口正确且双方可访问中继。",
                 ms>=0 ? (long?)ms : null,p95,attempts.Count(ok=>ok)+"/"+attempts.Count);
         }
@@ -229,7 +183,7 @@ namespace MCLink {
         }
         void Stop() {
             if (crossplayCancellation!=null) crossplayCancellation.Cancel();
-            if (selection!=null) { selection.Cancel(); selection=null; }
+            guestConfig=null; guestRoute=RouteMode.Automatic; nextGuestRestart=DateTime.MinValue;
             generation++; if(session!=null) {session.Dispose();session=null;}
             if (routeBridge!=null) {routeBridge.Dispose();routeBridge=null;}
             if(hosting) ticket.Clear(); hosting=false; address.Clear(); samples.Clear(); attempts.Clear();

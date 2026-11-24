@@ -20,14 +20,16 @@ final class RoomTicket {
     final String instance = UUID.randomUUID().toString();
     final int port;
     final boolean javaRoom;
+    final boolean reportsPlayerRoutes;
     private final String secret;
     private final String[] relays;
 
-    private RoomTicket(String secret, int port, String[] relays) {
+    private RoomTicket(String secret, int port, String[] relays, boolean reportsPlayerRoutes) {
         this.secret = secret;
         this.port = port;
         this.relays = relays;
         this.javaRoom = relays == null;
+        this.reportsPlayerRoutes = reportsPlayerRoutes;
     }
 
     static RoomTicket parse(String input) {
@@ -37,7 +39,7 @@ final class RoomTicket {
         if (java.matches()) {
             int port = Integer.parseInt(java.group(2));
             if (port < 1 || port > 65535) throw badTicket();
-            return new RoomTicket(java.group(1), port, null);
+            return new RoomTicket(java.group(1), port, null, code.startsWith("MCL2-"));
         }
         Matcher match = FORMAT.matcher(code);
         if (!match.matches()) throw badTicket();
@@ -58,7 +60,7 @@ final class RoomTicket {
                         && !(uri.getPort() == -1 && ("ws".equalsIgnoreCase(scheme) || "wss".equalsIgnoreCase(scheme))))
                         || relay.indexOf('"') >= 0 || relay.indexOf('\\') >= 0) throw badTicket();
             }
-            return new RoomTicket(match.group(1), bedrockPort, relays);
+            return new RoomTicket(match.group(1), bedrockPort, relays, false);
         } catch (Exception e) {
             throw badTicket();
         }
@@ -71,7 +73,7 @@ final class RoomTicket {
     String config(int localPort, String[] defaultRelays) {
         StringBuilder text = new StringBuilder(
                 "instance_name = \"" + instance + "\"\ndhcp = true\n");
-        if (javaRoom) text.append("listeners = [\"udp://0.0.0.0:0\"]\n");
+        if (javaRoom) text.append("listeners = [\"udp://0.0.0.0:0\", \"tcp://0.0.0.0:0\"]\n");
         else text.append("manual_routes = [\"").append(HOST).append("/32\"]\n");
         text.append("[network_identity]\nnetwork_name = \"mc-" + secret.substring(0, 12)
                 + "\"\nnetwork_secret = \"" + secret + "\"\n");
@@ -81,7 +83,7 @@ final class RoomTicket {
                 .append("\"\ndst_addr = \"").append(HOST).append(':').append(port)
                 .append("\"\nproto = \"tcp\"\n")
                 .append("[flags]\nno_tun = ").append(javaRoom)
-                .append("\nbind_device = false\nrelay_network_whitelist = \"\"\n")
+                .append("\nbind_device = false\nenable_ipv6 = true\nlatency_first = false\nrelay_network_whitelist = \"\"\n")
                 .append("[[acl.acl_v1.chains]]\nchain_type = 1\nenabled = true\ndefault_action = 2\n")
                 .toString();
     }

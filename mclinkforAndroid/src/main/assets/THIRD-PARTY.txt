@@ -1,0 +1,15 @@
+MCLink for Android bundles the EasyTier Android JNI library.
+
+EasyTier is licensed under the GNU Lesser General Public License, version 3.
+The corresponding source and build instructions are available at:
+https://github.com/EasyTier/EasyTier/tree/81487c363a56779e745eae927e130a813535c71e
+https://github.com/EasyTier/EasyTier/tree/81487c363a56779e745eae927e130a813535c71e/easytier-contrib/easytier-android-jni
+
+The unmodified arm64-v8a library comes from EasyTierCompose v1.0.10:
+https://github.com/originalFactor/EasyTierCompose/tree/v1.0.10/app/src/main/jniLibs/arm64-v8a
+
+The MCLink Android build can use a replacement EasyTier JNI library by
+updating the pinned source and checksum in the Android build scripts.
+
+GNU LGPL v3: https://www.gnu.org/licenses/lgpl-3.0.html
+GNU GPL v3: https://www.gnu.org/licenses/gpl-3.0.html

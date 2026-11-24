@@ -2,6 +2,6 @@ $ErrorActionPreference = 'Stop'
 Push-Location $PSScriptRoot
 try {
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    & $compiler /nologo /codepage:65001 /target:winexe /out:MCLink.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /resource:camp.png,MCLink.Camp Main.cs Room.cs Session.cs GuestConnection.cs CampLayout.cs
+    & $compiler /nologo /codepage:65001 /target:winexe /win32manifest:app.manifest /out:MCLink.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /r:System.IO.Compression.FileSystem.dll /resource:camp.png,MCLink.Camp Main.cs Room.cs Session.cs GuestConnection.cs CampLayout.cs PlayerRouteBridge.cs AndroidRoom.cs CrossplayServer.cs
     if ($LASTEXITCODE) { throw 'MCLink build failed' }
 } finally { Pop-Location }

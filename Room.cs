@@ -11,25 +11,57 @@ using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 
 namespace MCLink {
-    internal enum RouteMode { Automatic, DirectOnly, RelayOnly }
+    internal enum RouteMode { Automatic=0, DirectOnly=1, RelayOnly=2 }
 
     internal sealed class Room {
+        internal const string HostVirtualIp="10.144.144.1";
         static readonly string[] RelaySchemes = { "tcp", "udp", "ws", "wss", "quic" };
         internal readonly string Key;
         internal readonly int Port;
-        internal Room(string key, int port) { Key = key; Port = port; }
-        internal string Ticket { get { return "MCL1-" + Key + "-" + Port; } }
-        internal static Room Create(int port) {
+        internal readonly bool ReportsPlayerRoutes;
+        internal readonly int? BedrockPort;
+        internal readonly string[] Relays;
+        internal Room(string key, int port, bool reportsPlayerRoutes, int? bedrockPort=null, string[] relays=null) {
+            Key = key; Port = port; ReportsPlayerRoutes = reportsPlayerRoutes;
+            BedrockPort=bedrockPort; Relays=relays;
+        }
+        internal string Ticket {
+            get {
+                if (!BedrockPort.HasValue) return (ReportsPlayerRoutes ? "MCL2-" : "MCL1-") + Key + "-" + Port;
+                string peers=Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Join("\n", Relays)))
+                    .TrimEnd('=').Replace('+','-').Replace('/','_');
+                return "MCL3-"+Key+"-"+Port+"-"+BedrockPort.Value+"-"+peers;
+            }
+        }
+        internal static Room Create(int port, bool reportsPlayerRoutes = false, int? bedrockPort=null, string[] relays=null) {
             byte[] bytes = new byte[16];
             using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(bytes);
-            return new Room(BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant(), port);
+            var room=new Room(BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant(), port, reportsPlayerRoutes, bedrockPort, relays);
+            if (bedrockPort.HasValue && room.Ticket.Length>8192)
+                throw new ArgumentException("中继地址过长，请在 relay.txt 中减少节点数量。");
+            return room;
         }
         internal static Room Parse(string text) {
-            var m = Regex.Match(text.Trim(), @"\AMCL1-([a-f0-9]{32})-([0-9]{1,5})\z");
+            text=text.Trim();
+            if (text.StartsWith("MCL3-",StringComparison.Ordinal)) {
+                var cross=Regex.Match(text.Length>8192 ? "" : text, @"\AMCL3-([a-f0-9]{32})-([0-9]{1,5})-([0-9]{1,5})-([A-Za-z0-9_-]+)\z");
+                int java, bedrock;
+                if (cross.Success && int.TryParse(cross.Groups[2].Value,out java) && java>0 && java<=65535
+                    && int.TryParse(cross.Groups[3].Value,out bedrock) && bedrock>0 && bedrock<=65535 && java!=bedrock) {
+                    try {
+                        string encoded=cross.Groups[4].Value.Replace('-','+').Replace('_','/');
+                        encoded=encoded.PadRight((encoded.Length+3)/4*4,'=');
+                        var peers=new UTF8Encoding(false,true).GetString(Convert.FromBase64String(encoded)).Split('\n');
+                        if (peers.All(ValidRelay)) return new Room(cross.Groups[1].Value,java,true,bedrock,peers);
+                    } catch (FormatException) {} catch (DecoderFallbackException) {}
+                }
+                throw new ArgumentException("跨端房间码无效，请复制完整的 MCL3 房间码。");
+            }
+            var m = Regex.Match(text.Trim(), @"\AMCL([12])-([a-f0-9]{32})-([0-9]{1,5})\z");
             int port;
-            if (!m.Success || !int.TryParse(m.Groups[2].Value, out port) || port < 1 || port > 65535)
-                throw new ArgumentException("邀请码格式不正确，请复制完整的 MCL1 邀请码。");
-            return new Room(m.Groups[1].Value, port);
+            if (!m.Success || !int.TryParse(m.Groups[3].Value, out port) || port < 1 || port > 65535)
+                throw new ArgumentException("邀请码格式不正确，请复制完整的 MCL1 或 MCL2 邀请码。");
+            return new Room(m.Groups[2].Value, port, m.Groups[1].Value=="2");
         }
         internal static int FreePort() {
             var socket = new TcpListener(IPAddress.Loopback, 0);
@@ -55,11 +87,7 @@ namespace MCLink {
             for (int i = 0; i < lines.Length; i++) {
                 string value = lines[i].Trim();
                 if (value.Length == 0 || value.StartsWith("#", StringComparison.Ordinal)) continue;
-                Uri uri;
-                if (value.Any(char.IsWhiteSpace) || value.Any(char.IsControl) || value.IndexOfAny(new[] { '"', '\\' }) >= 0
-                    || !Uri.TryCreate(value, UriKind.Absolute, out uri)
-                    || !RelaySchemes.Contains(uri.Scheme)
-                    || String.IsNullOrEmpty(uri.Host) || uri.Port <= 0 || uri.UserInfo.Length != 0 || uri.Fragment.Length != 0)
+                if (!ValidRelay(value))
                     throw new InvalidOperationException("relay.txt 第 " + (i + 1) + " 行不是有效的中继地址，请检查协议、主机名和端口。");
                 relays.Add(value);
             }
@@ -67,23 +95,50 @@ namespace MCLink {
                 throw new InvalidOperationException("请在 relay.txt 中填写房主和好友都能连接的 EasyTier 中继地址。");
             return relays.Distinct(StringComparer.Ordinal).ToArray();
         }
+        static bool ValidRelay(string value) {
+            Uri uri;
+            return !value.Any(char.IsWhiteSpace) && !value.Any(char.IsControl)
+                && value.IndexOfAny(new[] { '"', '\\' })<0
+                && Uri.TryCreate(value, UriKind.Absolute, out uri)
+                && RelaySchemes.Contains(uri.Scheme) && uri.Host.Length>0 && uri.Port>0
+                && uri.UserInfo.Length==0 && uri.Fragment.Length==0;
+        }
         internal string Config(bool host, int localPort, IEnumerable<string> peers, string listener,
-                               RouteMode mode = RouteMode.Automatic) {
+                               RouteMode mode = RouteMode.Automatic, int? bedrockPort = null) {
             // A separate ACL per endpoint. Guest accepts no incoming application traffic.
             var sb = new StringBuilder();
             sb.AppendLine("instance_name = \"mclink-" + Guid.NewGuid().ToString("N") + "\"");
-            sb.AppendLine(host ? "ipv4 = \"10.144.144.1\"" : "dhcp = true");
+            sb.AppendLine(host ? "ipv4 = \""+HostVirtualIp+"\"" : "dhcp = true");
             sb.AppendLine("listeners = [\"" + listener + "\"]");
             sb.AppendLine("rpc_portal = \"127.0.0.1:0\"");
-            sb.AppendLine("[network_identity]\nnetwork_name = \"mc-" + Key.Substring(0,12) + "\"\nnetwork_secret = \"" + Key + "\"");
-            foreach (string peer in peers) sb.AppendLine("[[peer]]\nuri = \"" + peer + "\"");
-            if (!host) sb.AppendLine("[[port_forward]]\nbind_addr = \"127.0.0.1:" + localPort + "\"\ndst_addr = \"10.144.144.1:" + Port + "\"\nproto = \"tcp\"");
+            AppendNetwork(sb,peers);
+            if (!host) sb.AppendLine("[[port_forward]]\nbind_addr = \"127.0.0.1:" + localPort + "\"\ndst_addr = \""+HostVirtualIp+":" + Port + "\"\nproto = \"tcp\"");
             sb.AppendLine("[flags]\nno_tun = true\nbind_device = false\nrelay_network_whitelist = \"\"");
             if (mode == RouteMode.DirectOnly) sb.AppendLine("p2p_only = true");
             if (mode == RouteMode.RelayOnly) sb.AppendLine("disable_p2p = true");
-            sb.AppendLine("[[acl.acl_v1.chains]]\nname = \"room-inbound\"\nchain_type = 1\ndefault_action = 2\nenabled = true");
-            if (host) sb.AppendLine("[[acl.acl_v1.chains.rules]]\nname = \"minecraft\"\npriority = 1000\naction = 1\nprotocol = 1\nports = [\"" + Port + "\"]\nenabled = true");
+            AppendInboundAcl(sb);
+            if (host) {
+                AppendAllowedPort(sb,"minecraft",1000,1,Port);
+                if (bedrockPort.HasValue) {
+                    AppendAllowedPort(sb,"geyser-signaling",1001,1,bedrockPort.Value);
+                    AppendAllowedPort(sb,"geyser-game",1002,2,bedrockPort.Value);
+                }
+            }
             return sb.ToString();
+        }
+
+        void AppendNetwork(StringBuilder sb,IEnumerable<string> peers) {
+            sb.AppendLine("[network_identity]\nnetwork_name = \"mc-" + Key.Substring(0,12) + "\"\nnetwork_secret = \"" + Key + "\"");
+            foreach (string peer in peers) sb.AppendLine("[[peer]]\nuri = \"" + peer + "\"");
+        }
+
+        static void AppendInboundAcl(StringBuilder sb) {
+            sb.AppendLine("[[acl.acl_v1.chains]]\nname = \"room-inbound\"\nchain_type = 1\ndefault_action = 2\nenabled = true");
+        }
+
+        static void AppendAllowedPort(StringBuilder sb,string name,int priority,int protocol,int port) {
+            sb.AppendLine("[[acl.acl_v1.chains.rules]]\nname = \""+name+"\"\npriority = "+priority+
+                "\naction = 1\nprotocol = "+protocol+"\nports = [\""+port+"\"]\nenabled = true");
         }
     }
 

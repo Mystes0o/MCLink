@@ -1,4 +1,6 @@
 /runtime/
 *.exe
 *.pdb
+*.apk
+*.apk.idsig
 /mclink-*/

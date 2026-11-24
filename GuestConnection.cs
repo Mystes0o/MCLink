@@ -15,14 +15,16 @@ namespace MCLink {
         internal readonly Session Session;
         internal readonly int Port;
         internal readonly string Description;
+        internal readonly RouteMode Mode;
 
         GuestConnection(Room room, string[] peers, RouteMode mode) {
             Port = Room.FreePort();
+            Mode = mode;
             if (mode == RouteMode.DirectOnly) Description = "点对点直连";
             else if (mode == RouteMode.RelayOnly) {
                 var uri = new Uri(peers[0]);
                 Description = "中继 " + uri.GetLeftPart(UriPartial.Authority);
-            } else Description = "自动选路";
+            } else Description = "自动选路（线路未确认）";
             Session = new Session(room.Config(false, Port, peers, "udp://0.0.0.0:0", mode));
         }
 

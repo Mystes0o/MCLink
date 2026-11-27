@@ -16,6 +16,8 @@ Windows x64 桌面原型，适用于开启局域网共享的 Minecraft Java 版�
 
 ## 延迟读数
 
+Windows 和 Android 主界面的「连接日志」会显示近期建房、加入、线路变化、连通探测、TCP 转发及异常。可按级别筛选、搜索和复制，Windows 还可导出日志并查看 EasyTier 及跨端服务端的进程输出。日志保存在本次运行的内存中，退出前可复制或导出，邀请码和房间密钥会被隐藏。
+
 好友端定期经转发通道发送 Java 版服务器状态请求，收到状态后测一次协议 ping/pong 往返时间。P95 来自最近最多 24 次成功响应；探测成功数另算最近最多 24 次尝试。房主端的探测只检查自己的存档。读数包含游戏端应答开销，不能直接推算网络丢包率、服务器 TPS 或玩家实际游戏帧率。
 
 Windows 和 Android Java 访客使用一个 EasyTier 会话自动选路。可用时先通过中继进入，EasyTier 会继续尝试点对点直连。连接成功后，访客端显示当前的点对点或中继线路。Windows 读取线路需要与 `easytier-core.exe` 配套的 `easytier-cli.exe`。路由变化时 MCLink 保持本地游戏地址。两端启用 TCP 和 UDP 监听，公共 IPv6 可用时 EasyTier 也可以尝试 IPv6 直连。
@@ -59,7 +61,7 @@ Android Java 版支持 MCL1 和 MCL2 邀请码。双方使用兼容的 Java 版�
 
 ```powershell
 .\build.ps1
-& "$env:windir/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /codepage:65001 /r:System.Web.Extensions.dll /out:Smoke.exe Smoke.cs Room.cs Session.cs
+& "$env:windir/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /codepage:65001 /r:System.Web.Extensions.dll /out:Smoke.exe Smoke.cs Room.cs Session.cs DiagnosticLog.cs
 .\Smoke.exe
 ```
 

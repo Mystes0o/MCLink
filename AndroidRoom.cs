@@ -156,7 +156,11 @@ namespace MCLink {
             int current=++generation;
             var cancellation=new CancellationTokenSource();
             crossplayCancellation=cancellation;
-            IProgress<string> progress=new Progress<string>(message => {if (current==generation) ShowConnection(message);});
+            IProgress<string> progress=new Progress<string>(message => {
+                if (current!=generation) return;
+                DiagnosticLog.Info("跨端服务端",message);
+                ShowConnection(message);
+            });
             host.Enabled=join.Enabled=false;
             port.ReadOnly=ticket.ReadOnly=true;
             leave.Enabled=true;
@@ -178,7 +182,10 @@ namespace MCLink {
                 crossplay=prepared;
                 await StartRoom(true,prepared);
             } catch(Exception ex) {
-                if (current==generation) { Stop(); ShowConnection("跨端开房失败。"+ex.Message); }
+                if (current==generation) {
+                    DiagnosticLog.Error("跨端服务端","跨端开房失败",ex);
+                    Stop(); ShowConnection("跨端开房失败。"+ex.Message);
+                }
             } finally {
                 crossplayWork.Remove(completion.Task);
                 completion.SetResult(true);

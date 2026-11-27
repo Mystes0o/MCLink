@@ -63,6 +63,7 @@ namespace MCLink {
         readonly object logLock=new object();
         string lastError;
         internal bool Running { get { return !process.HasExited; } }
+        internal string ExitStatus { get { return "退出码 "+process.ExitCode; } }
 
         internal static CrossplayServer Start(string directory,string source,Action<string> progress,CancellationToken cancel,
                                               string cacheOverride=null,string javaOverride=null) {
@@ -125,8 +126,8 @@ namespace MCLink {
                 WorkingDirectory=directory, UseShellExecute=false, CreateNoWindow=true,
                 RedirectStandardInput=true, RedirectStandardOutput=true, RedirectStandardError=true
             }};
-            process.OutputDataReceived+=Capture;
-            process.ErrorDataReceived+=Capture;
+            process.OutputDataReceived+=(sender,eventArgs)=>Capture(eventArgs,false);
+            process.ErrorDataReceived+=(sender,eventArgs)=>Capture(eventArgs,true);
             try {
                 process.Start();
                 process.BeginOutputReadLine();
@@ -138,9 +139,10 @@ namespace MCLink {
             }
         }
 
-        void Capture(object sender,DataReceivedEventArgs args) {
+        void Capture(DataReceivedEventArgs args,bool stderr) {
             var line=args.Data;
             if (line==null) return;
+            DiagnosticLog.ProcessLine("跨端服务端",line,stderr);
             if (line.IndexOf("Done (",StringComparison.Ordinal)>=0 && line.Contains("For help")) paperReady=true;
             if (line.Contains("[floodgate]") && line.Contains("Took") && line.Contains("boot Floodgate")) floodgateReady=true;
             if (line.Contains("Built-in signaling started")) geyserReady=true;

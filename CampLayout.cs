@@ -69,6 +69,9 @@ namespace MCLink {
             canvas=new CampCanvas();
             Controls.Add(canvas);
 
+            var logs=new Button {Text="连接日志",AccessibleName="连接日志"};
+            logs.Click+=delegate { OpenLog(); };
+            Place(logs,new Rectangle(1185,5,138,39),19);
             Chrome("最小化", new Rectangle(1335,4,55,42), delegate { WindowState=FormWindowState.Minimized; });
             Chrome("最大化或还原", new Rectangle(1403,4,55,42), ToggleMaximized);
             Chrome("关闭", new Rectangle(1470,4,60,42), Close);
@@ -90,6 +93,7 @@ namespace MCLink {
                 motion.Text=canvas.Animated ? "暂停背景动效" : "播放背景动效";
             };
             canvas.ContextMenuStrip=menu;
+            menu.Items.Add("连接日志",null,delegate { OpenLog(); });
             FormClosed+=delegate {menu.Dispose();};
 
             Field(port,"游戏端口",null,new Rectangle(276,520,413,52),37);
@@ -285,7 +289,10 @@ namespace MCLink {
         }
 
         void ShowRoute(string description) {
-            routeValue.Text="当前线路："+description;
+            string text="当前线路："+description;
+            if (routeValue.Text==text) return;
+            routeValue.Text=text;
+            DiagnosticLog.Info("线路",description);
             tooltip.SetToolTip(routeValue,routeValue.Text);
         }
 

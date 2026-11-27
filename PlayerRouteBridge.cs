@@ -15,7 +15,9 @@ namespace MCLink {
             internal readonly TcpClient Source, Target = new TcpClient();
             internal string Name;
             internal RouteMode Route;
-            internal Link(TcpClient source) { Source=source; }
+            internal readonly int Id;
+            internal long Upload, Download;
+            internal Link(TcpClient source,int id) { Source=source; Id=id; }
             internal void Close() { Source.Close(); Target.Close(); }
         }
 
@@ -23,7 +25,8 @@ namespace MCLink {
         readonly HashSet<Link> links=new HashSet<Link>();
         readonly int targetPort;
         readonly Func<RouteMode> report;
-        bool disposed;
+        volatile bool disposed;
+        static int nextLink;
 
         // The guest prepends a report. The host removes it and observes the login name.
         internal PlayerRouteBridge(int targetPort, Func<RouteMode> report=null) {
@@ -31,6 +34,7 @@ namespace MCLink {
             this.report=report;
             listener.Start();
             Port=((IPEndPoint)listener.LocalEndpoint).Port;
+            DiagnosticLog.Info("TCP 转发","监听 127.0.0.1:"+Port+" → 127.0.0.1:"+targetPort);
             Accept();
         }
 
@@ -54,24 +58,27 @@ namespace MCLink {
             try {
                 while (true) {
                     var client=await listener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    var link=new Link(client);
+                    var link=new Link(client,Interlocked.Increment(ref nextLink));
                     lock (links) {
                         if (disposed) { link.Close(); return; }
                         links.Add(link);
                     }
                     Forward(link);
                 }
-            } catch (SocketException) {}
-              catch (ObjectDisposedException) {}
-              catch (InvalidOperationException) {}
+            } catch (Exception ex) {
+                if (!disposed) DiagnosticLog.Error("TCP 转发","端口 "+Port+" 接收连接失败",ex);
+            }
         }
 
         async void Forward(Link link) {
+            string phase="连接目标端口 "+targetPort;
             try {
                 link.Source.NoDelay=link.Target.NoDelay=true;
                 await link.Target.ConnectAsync(IPAddress.Loopback,targetPort).ConfigureAwait(false);
+                DiagnosticLog.Info("TCP 转发","#"+link.Id+" 已连接 "+Port+" → "+targetPort);
                 var input=link.Source.GetStream();
                 var output=link.Target.GetStream();
+                phase="处理握手";
                 if (report!=null) {
                     // Zero is not a valid first Minecraft packet length.
                     var header=new byte[] {0,(byte)report()};
@@ -81,22 +88,29 @@ namespace MCLink {
                     using (timeout.Token.Register(link.Source.Close))
                         await ReadHostPrefix(link,input,output).ConfigureAwait(false);
                 }
-                var upload=Pump(input,output,link.Target);
-                var download=Pump(output,input,link.Source);
+                phase="双向传输";
+                var upload=Pump(input,output,link.Target,count=>Interlocked.Add(ref link.Upload,count));
+                var download=Pump(output,input,link.Source,count=>Interlocked.Add(ref link.Download,count));
                 await (await Task.WhenAny(upload,download).ConfigureAwait(false)).ConfigureAwait(false);
                 await Task.WhenAll(upload,download).ConfigureAwait(false);
-            } catch (IOException) {}
-              catch (SocketException) {}
-              catch (ObjectDisposedException) {}
-              catch (InvalidOperationException) {}
+            } catch (Exception ex) {
+                if (!disposed) DiagnosticLog.Error("TCP 转发","#"+link.Id+" "+phase+"失败",ex);
+            }
             finally {
                 link.Close();
                 lock (links) links.Remove(link);
+                DiagnosticLog.Info("TCP 转发","#"+link.Id+" 已关闭，转发上行 "+
+                    Interlocked.Read(ref link.Upload)+" B / 下行 "+Interlocked.Read(ref link.Download)+" B（握手后）");
             }
         }
 
-        static async Task Pump(Stream source, Stream destination, TcpClient target) {
-            await source.CopyToAsync(destination,16384).ConfigureAwait(false);
+        static async Task Pump(Stream source, Stream destination, TcpClient target,Action<int> transferred) {
+            var buffer=new byte[16384];
+            int count;
+            while ((count=await source.ReadAsync(buffer,0,buffer.Length).ConfigureAwait(false))>0) {
+                await destination.WriteAsync(buffer,0,count).ConfigureAwait(false);
+                transferred(count);
+            }
             var socket=target.Client;
             if (socket!=null) socket.Shutdown(SocketShutdown.Send);
         }
@@ -134,8 +148,9 @@ namespace MCLink {
                         link.Route=route;
                     }
                 }
-            } catch (InvalidDataException) {
+            } catch (InvalidDataException ex) {
                 // Keep forwarding when the game uses an unrecognized packet format.
+                DiagnosticLog.Warn("TCP 转发","#"+link.Id+" 无法识别登录封包，继续转发（"+ex.Message+"）");
             } catch (EndOfStreamException) {}
         }
 

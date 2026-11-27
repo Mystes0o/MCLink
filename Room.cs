@@ -184,15 +184,17 @@ namespace MCLink {
     }
 
     internal static class GameProbe {
-        internal static void AnnounceLocalRoom(int gamePort) {
+        internal static Exception AnnounceLocalRoom(int gamePort) {
             // Java Edition uses the datagram source IP as the address to connect to.
             var announcement=Encoding.UTF8.GetBytes("[MOTD]MCLink 房间[/MOTD][AD]"+
                 gamePort.ToString(System.Globalization.CultureInfo.InvariantCulture)+"[/AD]");
             try {
                 using (var udp=new UdpClient(new IPEndPoint(IPAddress.Loopback,0)))
                     udp.Send(announcement,announcement.Length,new IPEndPoint(IPAddress.Loopback,4445));
-            } catch (SocketException) {
+                return null;
+            } catch (SocketException ex) {
                 // Manual connection is still available if local discovery is unavailable.
+                return ex;
             }
         }
 

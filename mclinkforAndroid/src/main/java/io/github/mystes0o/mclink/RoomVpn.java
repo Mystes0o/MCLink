@@ -71,11 +71,13 @@ public final class RoomVpn extends VpnService {
         try {
             room = RoomTicket.parse(intent == null ? "" : intent.getStringExtra(EXTRA_TICKET));
         } catch (RuntimeException invalid) {
+            DiagnosticLog.error("房间", "服务无法读取邀请码", invalid);
             state = new State("房间码无效，请重新粘贴。", 0, false);
             stopSelf(startId);
             return START_NOT_STICKY;
         }
         joined = alive = true;
+        DiagnosticLog.info("房间", room.javaRoom ? "加入 Java 房间" : "加入基岩跨端房间");
         state = new State("正在连接房主…", 0, true, room.javaRoom);
         ENGINE.execute(() -> connect(room, startId));
         return START_NOT_STICKY;
@@ -91,10 +93,13 @@ public final class RoomVpn extends VpnService {
                 probePort = reservation.getLocalPort();
             }
             String[] relays = room.javaRoom ? bundledRelays() : null;
-            if (EasyTierJNI.runNetworkInstance(room.config(probePort, relays)) != 0)
-                throw new IllegalStateException("EasyTier 启动失败，请检查房间码和设备网络。");
+            int result = EasyTierJNI.runNetworkInstance(room.config(probePort, relays));
+            if (result != 0) throw nativeFailure("EasyTier 启动失败", result);
+            DiagnosticLog.info("EasyTier", "组网已启动，通向房主 " + RoomTicket.HOST + ":" + room.port);
             if (room.reportsPlayerRoutes) bridge = new JavaRouteBridge(probePort, () -> route);
             int gamePort = bridge == null ? probePort : bridge.port();
+            if (room.javaRoom) DiagnosticLog.info("TCP 转发", "游戏入口 " + RoomTicket.LOOPBACK + ":"
+                    + gamePort + " → 本机代理端口 " + probePort + " → 房主端口 " + room.port);
             long deadline = SystemClock.elapsedRealtime() + 45000;
             while (!room.javaRoom && alive && SystemClock.elapsedRealtime() < deadline && tunnel == null) {
                 JSONObject info = networkInfo(room.instance);
@@ -109,19 +114,31 @@ public final class RoomVpn extends VpnService {
                     tunnel = new Builder().setSession("MCLink 房间").setMtu(1380)
                             .addAddress(ip, 24).addRoute(RoomTicket.HOST, 32)
                             .addAllowedApplication(GAME_PACKAGE).establish();
-                    if (tunnel == null || EasyTierJNI.setTunFd(room.instance, tunnel.getFd()) != 0)
+                    if (tunnel == null)
                         throw new IllegalStateException("无法启用 MCLink VPN，请重新授权。");
+                    result = EasyTierJNI.setTunFd(room.instance, tunnel.getFd());
+                    if (result != 0) throw nativeFailure("EasyTier 绑定 VPN 失败", result);
+                    DiagnosticLog.info("VPN", "已分配虚拟地址 " + ip + "，仅 Minecraft 流量路由到 " + RoomTicket.HOST);
                 } else Thread.sleep(400);
             }
             if (!room.javaRoom && alive && tunnel == null)
                 throw new IllegalStateException("等待房间地址超时，请确认房主在线。");
             boolean connected = false;
+            boolean reachable = false;
+            int previousRoute = -1;
             int unsuccessful = 0;
             while (alive) {
                 boolean available = room.javaRoom ? JavaGameProbe.check(probePort, room.port) : probe(probePort);
                 if (!alive) break;
-                if (room.javaRoom) route = available ? hostRoute(networkInfo(room.instance)) : 0;
+                route = available ? hostRoute(networkInfo(room.instance)) : 0;
+                if (available && previousRoute != route) {
+                    DiagnosticLog.info("线路", route == 1 ? "点对点直连" : route == 2 ? "中继" : "线路未确认");
+                    previousRoute = route;
+                }
                 if (available) {
+                    if (!reachable) DiagnosticLog.info(room.javaRoom ? "Java 探测" : "Geyser 信令",
+                            "房主已响应，端口 " + room.port);
+                    reachable = true;
                     connected = true;
                     unsuccessful = 0;
                     if (room.javaRoom) LanRoomAnnouncement.send(gamePort);
@@ -131,22 +148,41 @@ public final class RoomVpn extends VpnService {
                                     "\n在 Java 版「多人游戏」中选择 MCLink 房间。", gamePort, true, true)
                             : new State("已连接房主，可以打开 Minecraft", room.port, true);
                 } else if (++unsuccessful >= 4) {
+                    if (unsuccessful == 4) DiagnosticLog.warn("房间", connected ? "与房主暂时断开，正在重连"
+                            : "还未收到房主响应，正在重试");
+                    reachable = false;
+                    previousRoute = -1;
                     state = new State(connected ? "与房主暂时断开，正在重连…" :
                             "还未收到房主响应，正在重试…", 0, true, room.javaRoom);
                 }
                 Thread.sleep(2000);
             }
         } catch (android.content.pm.PackageManager.NameNotFoundException missing) {
+            DiagnosticLog.error("VPN", "找不到 Minecraft 国际基岩版", missing);
             if (alive) endMessage = "请先安装 Minecraft 国际基岩版。";
         } catch (Exception | LinkageError error) {
-            if (alive) endMessage = error instanceof IllegalStateException && error.getMessage() != null
-                    ? error.getMessage() : "连接失败，请重试。";
+            if (alive) {
+                DiagnosticLog.error("房间", "连接流程失败", error);
+                endMessage = error instanceof IllegalStateException && error.getMessage() != null
+                        ? DiagnosticLog.sanitize(error.getMessage().split("\\r?\\n", 2)[0]) : "连接失败，请重试。";
+            }
         } finally {
             if (bridge != null) bridge.close();
-            try { if (tunnel != null) tunnel.close(); } catch (Exception ignored) {}
-            try { EasyTierJNI.retainNetworkInstance(new String[0]); } catch (LinkageError ignored) {}
+            try { if (tunnel != null) tunnel.close(); }
+            catch (Exception error) { DiagnosticLog.error("VPN", "关闭 VPN 失败", error); }
+            try {
+                int result = EasyTierJNI.retainNetworkInstance(new String[0]);
+                if (result != 0) throw nativeFailure("停止 EasyTier 失败", result);
+            } catch (RuntimeException | LinkageError error) {
+                DiagnosticLog.error("EasyTier", "停止组网失败", error);
+            }
             stopSelf(startId);
         }
+    }
+
+    private static IllegalStateException nativeFailure(String operation, int code) {
+        String detail = EasyTierJNI.getLastError();
+        return new IllegalStateException(operation + "，返回码 " + code + (detail == null ? "" : "\n" + detail));
     }
 
     private String[] bundledRelays() throws java.io.IOException {
@@ -165,9 +201,11 @@ public final class RoomVpn extends VpnService {
     private static JSONObject networkInfo(String instance) {
         try {
             String json = EasyTierJNI.collectNetworkInfos(1);
-            JSONObject map = json == null ? null : new JSONObject(json).optJSONObject("map");
+            if (json == null) throw nativeFailure("读取 EasyTier 线路信息失败", -1);
+            JSONObject map = new JSONObject(json).optJSONObject("map");
             return map == null ? null : map.optJSONObject(instance);
         } catch (org.json.JSONException | RuntimeException unavailable) {
+            DiagnosticLog.repeatedError("EasyTier", "读取线路信息失败", unavailable);
             return null;
         }
     }
@@ -194,20 +232,23 @@ public final class RoomVpn extends VpnService {
                     + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             InputStream input = socket.getInputStream();
             for (char expected : "HTTP/".toCharArray())
-                if (input.read() != expected) return false;
+                if (input.read() != expected) throw new java.io.IOException("房主未返回有效 HTTP 信令");
             return true;
         } catch (java.io.IOException unavailable) {
+            DiagnosticLog.repeatedError("Geyser 信令", "查询房主失败，代理端口 " + port, unavailable);
             return false;
         }
     }
 
     @Override public void onRevoke() {
         endMessage = "Android 已撤销 VPN 授权。";
+        DiagnosticLog.warn("VPN", endMessage);
         stopSelf();
     }
 
     @Override public void onDestroy() {
         alive = false;
+        if (joined) DiagnosticLog.info("房间", "房间连接已关闭");
         if (state.running) state = new State(endMessage, 0, false);
         stopForeground(STOP_FOREGROUND_REMOVE);
         super.onDestroy();

@@ -14,10 +14,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.IntSupplier;
 
 final class JavaRouteBridge implements Closeable {
     private static final int MAX_CONNECTIONS = 16;
+    private static final AtomicInteger nextLink = new AtomicInteger();
     private final ServerSocket listener;
     private final InetSocketAddress target;
     private final IntSupplier route;
@@ -40,6 +42,7 @@ final class JavaRouteBridge implements Closeable {
                 Socket client = listener.accept();
                 synchronized (active) {
                     if (listener.isClosed() || active.size() >= MAX_CONNECTIONS) {
+                        if (!listener.isClosed()) DiagnosticLog.warn("TCP 转发", "已达到并发连接上限");
                         closeSocket(client);
                         continue;
                     }
@@ -48,7 +51,8 @@ final class JavaRouteBridge implements Closeable {
                     workers.execute(() -> open(link));
                 }
             }
-        } catch (IOException ignored) {
+        } catch (IOException error) {
+            if (!listener.isClosed()) DiagnosticLog.error("TCP 转发", "接收本地连接失败", error);
             close();
         }
     }
@@ -56,26 +60,33 @@ final class JavaRouteBridge implements Closeable {
     private void open(Link link) {
         try {
             link.target.connect(target, 2500);
+            DiagnosticLog.info("TCP 转发", "#" + link.id + " 已连接 " + port() + " → " + target.getPort());
             link.source.setTcpNoDelay(true);
             link.target.setTcpNoDelay(true);
             // This is the same MCL2 header understood by existing Windows hosts.
             link.target.getOutputStream().write(new byte[] {0, (byte) route.getAsInt()});
-            workers.execute(() -> copy(link, link.target, link.source));
-            copy(link, link.source, link.target);
+            workers.execute(() -> copy(link, link.target, link.source, link.download));
+            copy(link, link.source, link.target, link.upload);
         } catch (IOException | RejectedExecutionException unavailable) {
+            if (!listener.isClosed()) DiagnosticLog.error("TCP 转发", "#" + link.id + " 建立转发失败", unavailable);
             close(link);
         }
     }
 
-    private void copy(Link link, Socket from, Socket to) {
+    private void copy(Link link, Socket from, Socket to, AtomicLong transferred) {
         try {
             InputStream input = from.getInputStream();
             OutputStream output = to.getOutputStream();
             byte[] buffer = new byte[16384];
-            for (int length; (length = input.read(buffer)) != -1;) output.write(buffer, 0, length);
+            for (int length; (length = input.read(buffer)) != -1;) {
+                output.write(buffer, 0, length);
+                transferred.addAndGet(length);
+            }
             to.shutdownOutput();
             if (link.remaining.decrementAndGet() == 0) close(link);
         } catch (IOException disconnected) {
+            if (!listener.isClosed() && !from.isClosed() && !to.isClosed())
+                DiagnosticLog.error("TCP 转发", "#" + link.id + " 传输失败", disconnected);
             close(link);
         }
     }
@@ -83,7 +94,9 @@ final class JavaRouteBridge implements Closeable {
     private void close(Link link) {
         closeSocket(link.source);
         closeSocket(link.target);
-        synchronized (active) { active.remove(link); }
+        synchronized (active) {
+            if (active.remove(link)) recordClose(link);
+        }
     }
 
     @Override public void close() {
@@ -92,10 +105,16 @@ final class JavaRouteBridge implements Closeable {
             for (Link link : active) {
                 closeSocket(link.source);
                 closeSocket(link.target);
+                recordClose(link);
             }
             active.clear();
             workers.shutdown();
         }
+    }
+
+    private static void recordClose(Link link) {
+        DiagnosticLog.info("TCP 转发", "#" + link.id + " 已关闭，上行 "
+                + link.upload.get() + " B / 下行 " + link.download.get() + " B");
     }
 
     private static void closeSocket(Socket socket) {
@@ -103,8 +122,10 @@ final class JavaRouteBridge implements Closeable {
     }
 
     private static final class Link {
+        final int id = nextLink.incrementAndGet();
         final Socket source;
         final Socket target = new Socket();
+        final AtomicLong upload = new AtomicLong(), download = new AtomicLong();
         final AtomicInteger remaining = new AtomicInteger(2);
 
         Link(Socket source) { this.source = source; }

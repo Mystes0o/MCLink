@@ -1,6 +1,7 @@
 package io.github.mystes0o.mclink;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -15,9 +16,12 @@ import android.os.Looper;
 import android.text.InputType;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -100,12 +104,79 @@ public final class MainActivity extends Activity {
         leave = button("离开房间", false);
         leave.setOnClickListener(view -> stopService(new Intent(this, RoomVpn.class)));
         add(content, leave, 8);
+        Button logs = button("连接日志", false);
+        logs.setOnClickListener(view -> showLogs());
+        add(content, logs, 8);
         code.addTextChangedListener(new android.text.TextWatcher() {
             @Override public void beforeTextChanged(CharSequence value, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence value, int start, int before, int count) { render(); }
             @Override public void afterTextChanged(android.text.Editable value) {}
         });
         render();
+    }
+
+    private void showLogs() {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(16), dp(8), dp(16), 0);
+        Spinner level = new Spinner(this);
+        level.setContentDescription("日志级别");
+        ArrayAdapter<String> choices = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
+                new String[] {"全部级别", "警告和错误", "仅错误"});
+        choices.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        level.setAdapter(choices);
+        add(content, level, 0);
+        EditText search = new EditText(this);
+        search.setSingleLine(true);
+        search.setHint("搜索日志");
+        add(content, search, 0);
+        CheckBox pause = new CheckBox(this);
+        pause.setText("暂停刷新");
+        add(content, pause, 0);
+        ScrollView scroll = new ScrollView(this);
+        TextView output = label("", 13);
+        output.setTextIsSelectable(true);
+        scroll.addView(output);
+        int maxHeight = getResources().getDisplayMetrics().heightPixels / 3;
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, maxHeight));
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("连接日志").setView(content)
+                .setNegativeButton("关闭", null).setPositiveButton("复制当前结果", null).create();
+        Runnable refreshLogs = new Runnable() {
+            long lastVersion = -1;
+            int lastLevel = -1;
+            String lastSearch = "";
+
+            @Override public void run() {
+                long version = DiagnosticLog.version();
+                int minimum = level.getSelectedItemPosition();
+                String query = search.getText().toString();
+                boolean changed = minimum != lastLevel || !query.equals(lastSearch);
+                if (changed || (!pause.isChecked() && lastVersion != version)) {
+                    String text = DiagnosticLog.read(minimum, query);
+                    output.setTag(text);
+                    output.setText(text.isEmpty() ? "没有符合条件的日志。" : text);
+                    lastVersion = version;
+                    lastLevel = minimum;
+                    lastSearch = query;
+                    scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+                }
+                if (dialog.isShowing()) ui.postDelayed(this, 750);
+            }
+        };
+        dialog.setOnDismissListener(value -> ui.removeCallbacks(refreshLogs));
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            String text = (String) output.getTag();
+            if (text == null || text.isEmpty()) return;
+            try {
+                getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("MCLink 日志", text));
+                Toast.makeText(this, "已复制日志", Toast.LENGTH_SHORT).show();
+            } catch (RuntimeException error) {
+                DiagnosticLog.error("日志", "复制日志失败", error);
+                Toast.makeText(this, "复制失败，请选中文本后手动复制。", Toast.LENGTH_SHORT).show();
+            }
+        });
+        ui.post(refreshLogs);
     }
 
     private void pasteAndJoin() {
@@ -121,11 +192,13 @@ public final class MainActivity extends Activity {
         try {
             room = RoomTicket.parse(input);
         } catch (IllegalArgumentException badRoom) {
+            DiagnosticLog.error("房间", "邀请码校验失败", badRoom);
             RoomVpn.state = new RoomVpn.State(badRoom.getMessage(), 0, false);
             render();
             return;
         }
         if (!room.javaRoom && getPackageManager().getLaunchIntentForPackage(RoomVpn.GAME_PACKAGE) == null) {
+            DiagnosticLog.warn("房间", "未找到 Minecraft 国际基岩版");
             RoomVpn.state = new RoomVpn.State("请先安装 Minecraft 国际基岩版。", 0, false);
             render();
             return;
@@ -142,7 +215,12 @@ public final class MainActivity extends Activity {
     private void connect() {
         if (pendingCode == null) return;
         RoomVpn.state = new RoomVpn.State("正在启动房间连接…", 0, true);
-        startForegroundService(new Intent(this, RoomVpn.class).putExtra(RoomVpn.EXTRA_TICKET, pendingCode));
+        try {
+            startForegroundService(new Intent(this, RoomVpn.class).putExtra(RoomVpn.EXTRA_TICKET, pendingCode));
+        } catch (RuntimeException error) {
+            DiagnosticLog.error("房间", "启动连接服务失败", error);
+            RoomVpn.state = new RoomVpn.State("无法启动房间连接，请查看连接日志。", 0, false);
+        }
         pendingCode = null;
         code.setText("");
         render();
@@ -153,6 +231,7 @@ public final class MainActivity extends Activity {
         if (request != VPN_PERMISSION) return;
         if (result == RESULT_OK) connect();
         else {
+            DiagnosticLog.warn("VPN", "用户取消 VPN 授权");
             pendingCode = null;
             RoomVpn.state = new RoomVpn.State("已取消 VPN 授权。", 0, false);
             render();
@@ -167,6 +246,7 @@ public final class MainActivity extends Activity {
         try {
             startActivity(server);
         } catch (android.content.ActivityNotFoundException unsupportedLink) {
+            DiagnosticLog.error("Minecraft", "无法通过服务器链接打开游戏", unsupportedLink);
             Intent game = getPackageManager().getLaunchIntentForPackage(RoomVpn.GAME_PACKAGE);
             if (game != null) startActivity(game);
             else Toast.makeText(this, "请先安装 Minecraft 国际基岩版。", Toast.LENGTH_SHORT).show();

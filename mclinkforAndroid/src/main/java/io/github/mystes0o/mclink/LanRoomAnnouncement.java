@@ -23,6 +23,7 @@ final class LanRoomAnnouncement {
             }
         } catch (IOException unavailable) {
             // Manual connection is still available if local discovery is unavailable.
+            DiagnosticLog.repeatedError("局域网发现", "发送 Java 房间广播失败", unavailable);
         }
     }
 }

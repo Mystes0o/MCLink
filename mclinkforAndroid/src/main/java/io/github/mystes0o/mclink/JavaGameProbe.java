@@ -34,19 +34,22 @@ final class JavaGameProbe {
             output.writeByte(0);
 
             int length = readVarInt(input);
-            if (length < 3 || length > 1048576) return false;
+            if (length < 3 || length > 1048576) throw new IOException("Java 状态封包长度无效");
             byte[] reply = new byte[length];
             input.readFully(reply);
             DataInputStream status = new DataInputStream(new ByteArrayInputStream(reply));
             if (readVarInt(status) != 0 || readVarInt(status) != status.available() || status.read() != '{')
-                return false;
+                throw new IOException("房主未返回有效的 Java 状态");
 
             long nonce = System.nanoTime();
             output.writeByte(9);
             output.writeByte(1);
             output.writeLong(nonce);
-            return readVarInt(input) == 9 && input.readUnsignedByte() == 1 && input.readLong() == nonce;
+            if (readVarInt(input) != 9 || input.readUnsignedByte() != 1 || input.readLong() != nonce)
+                throw new IOException("Java ping/pong 响应不匹配");
+            return true;
         } catch (IOException unavailable) {
+            DiagnosticLog.repeatedError("Java 探测", "查询房主失败，代理端口 " + localPort, unavailable);
             return false;
         }
     }
